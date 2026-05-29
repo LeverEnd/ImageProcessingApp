@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Teljes Képfeldolgozó Pipeline - Egyfájlos CloudFormation (Ütközésmentes + CloudWatch Alarm javítva)'
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Default: "mark.gajdan@gmail.com"
+    Description: "Ide érkeznek az SNS értesítések"
+
+Resources:
+  # ==========================================
+  # 1. TÁROLÓK ÉS ADATBÁZIS
+  # ==========================================
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: ["PUT", "POST", "GET"]
+            AllowedOrigins: ["*"]
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: ["GET"]
+            AllowedOrigins: ["*"]
+
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "ImageMetadata-CFN" 
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "filename"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "filename"
+          KeyType: "HASH"
+
+  # ==========================================
+  # 2. ÉRTESÍTÉSEK
+  # ==========================================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "image-processing-alerts-cfn" 
+
+  EmailSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  # ==========================================
+  # 3. LAMBDA FÜGGVÉNYEK (INLINE CODE)
+  # ==========================================
+  
+  FormatCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import os, boto3
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          def lambda_handler(event, context):
+              bucket = event['detail']['bucket']['name']
+              key = event['detail']['object']['key']
+              valid_ext = ('.jpg', '.jpeg', '.png')
+              is_valid = key.lower().endswith(valid_ext)
+              if not is_valid:
+                  try:
+                      s3.delete_object(Bucket=bucket, Key=key)
+                      msg = " A fajlt toroltuk."
+                  except: msg = " Hiba a torlesnel."
+                  sns.publish(TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f"Hibas formatum: {key}. Csak JPG/PNG engedelyezett.{msg}",
+                      Subject="Kepfeldolgozo: Ervenytelen formatum")
+              return {"valid": is_valid, "bucket": bucket, "key": key}
+
+  RekognitionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          rek = boto3.client('rekognition')
+          def lambda_handler(event, context):
+              res = rek.detect_labels(Image={'S3Object':{'Bucket':event['bucket'],'Name':event['key']}}, MaxLabels=3)
+              return {"bucket": event['bucket'], "key": event['key'], "labels": [l['Name'] for l in res['Labels']]}
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Timeout: 30
+      Layers: 
+        - "arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p39-pillow:1"
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+      Code:
+        ZipFile: |
+          import os, boto3, io, time
+          from PIL import Image
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              #time.sleep(12)
+              obj = s3.get_object(Bucket=event['bucket'], Key=event['key'])
+              img = Image.open(io.BytesIO(obj['Body'].read()))
+              if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+              img = img.resize((500, 500), Image.LANCZOS)
+              buffer = io.BytesIO()
+              img.save(buffer, "JPEG")
+              buffer.seek(0)
+              p_key = f"resized-{event['key']}"
+              s3.put_object(Bucket=os.environ['PROCESSED_BUCKET'], Key=p_key, Body=buffer, ContentType='image/jpeg')
+              return {"key": event['key'], "labels": event['labels'], "url": f"https://{os.environ['PROCESSED_BUCKET']}.s3.amazonaws.com/{p_key}"}
+
+  DbUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ImageMetadataTable
+      Code:
+        ZipFile: |
+          import os, boto3
+          from datetime import datetime
+          db = boto3.resource('dynamodb')
+          def lambda_handler(event, context):
+              db.Table(os.environ['DYNAMO_TABLE']).put_item(Item={
+                  'filename': event['key'], 'labels': event['labels'],
+                  'url': event['url'], 'upload_time': datetime.now().isoformat()})
+              return {"status": "success"}
+
+  GetImagesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref ImageMetadataTable
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          from decimal import Decimal
+          s3 = boto3.client('s3')
+          db = boto3.resource('dynamodb')
+          class DecEnc(json.JSONEncoder):
+              def default(self, obj): return float(obj) if isinstance(obj, Decimal) else super().default(obj)
+          def lambda_handler(event, context):
+              items = db.Table(os.environ['DYNAMO_TABLE']).scan().get('Items', [])
+              for i in items:
+                  try:
+                      i['url'] = s3.generate_presigned_url('get_object', Params={'Bucket': os.environ['PROCESSED_BUCKET'], 'Key': f"resized-{i['filename']}"}, ExpiresIn=3600)
+                  except: i['url'] = "Error"
+              return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps(items, cls=DecEnc)}
+
+  PresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              fn = event.get('queryStringParameters', {}).get('filename', 'upload.jpg')
+              url = s3.generate_presigned_url('put_object', Params={'Bucket': os.environ['SOURCE_BUCKET'], 'Key': fn}, ExpiresIn=3600)
+              return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"upload_url": url, "filename": fn})}
+
+  DeleteImageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          DYNAMO_TABLE: !Ref ImageMetadataTable
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          s3 = boto3.client('s3')
+          db = boto3.resource('dynamodb')
+          def lambda_handler(event, context):
+              fn = event.get('pathParameters', {}).get('name')
+              if not fn: return {"statusCode": 400, "body": "Hianyzik a nev"}
+              s3.delete_object(Bucket=os.environ['SOURCE_BUCKET'], Key=fn)
+              s3.delete_object(Bucket=os.environ['PROCESSED_BUCKET'], Key=f"resized-{fn}")
+              db.Table(os.environ['DYNAMO_TABLE']).delete_item(Key={'filename': fn})
+              return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"msg": "Torolve"})}
+
+  # ==========================================
+  # 4. STEP FUNCTIONS (PIPELINE)
+  # ==========================================
+  ImagePipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: "ImageProcessingPipeline-CFN" 
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      DefinitionString: !Sub |
+        {
+          "StartAt": "FormatCheck",
+          "States": {
+            "FormatCheck": { "Type": "Task", "Resource": "${FormatCheckerFunction.Arn}", "Next": "IsFormatValid" },
+            "IsFormatValid": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.valid", "BooleanEquals": false, "Next": "EndPipeline"}],
+              "Default": "Rekognition"
+            },
+            "Rekognition": { "Type": "Task", "Resource": "${RekognitionFunction.Arn}", "Next": "ProcessImage" },
+            "ProcessImage": { "Type": "Task", "Resource": "${ProcessorFunction.Arn}", "Next": "UploadDB" },
+            "UploadDB": { "Type": "Task", "Resource": "${DbUploaderFunction.Arn}", "End": true },
+            "EndPipeline": { "Type": "Pass", "End": true }
+          }
+        }
+
+  # ==========================================
+  # 5. CLOUDWATCH ALARM (JAVÍTVA)
+  # ==========================================
+  ProcessorTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "ProcessorLambdaTimeout-cfn"
+      AlarmDescription: "Riasztás, ha a Processor függvény 10 másodpercnél tovább fut."
+      ComparisonOperator: "GreaterThanThreshold"
+      EvaluationPeriods: 1
+      MetricName: "Duration"
+      Namespace: "AWS/Lambda"
+      Period: 60
+      Statistic: "Maximum"
+      Threshold: 10000 # 10 másodperc (milliszekundumban értendő)
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: "FunctionName"
+          Value: !Ref ProcessorFunction
+
+  # ==========================================
+  # 6. AUTOMATIZÁLT INDÍTÁS (EVENTBRIDGE)
+  # ==========================================
+  S3UploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "S3 feltoltes inditja a pipeline-t"
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket: { name: [!Ref SourceBucket] }
+      Targets:
+        - Arn: !Ref ImagePipeline
+          Id: "StepFunctionTarget"
+          RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+
+  # ==========================================
+  # 7. API GATEWAY (KÜLSŐ ELÉRÉS)
+  # ==========================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: "image-api-cfn" 
+      ProtocolType: "HTTP"
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "prod"
+      AutoDeploy: true
+
+  # API Integrációk
+  IntGet:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetImagesFunction.Arn
+      PayloadFormatVersion: "2.0"
+  
+  IntPre:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PresignedUrlFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  IntDel:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DeleteImageFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  # Útvonalak (Routes)
+  RouteGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /images"
+      Target: !Sub "integrations/${IntGet}"
+
+  RoutePre:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /presigned-url"
+      Target: !Sub "integrations/${IntPre}"
+
+  RouteDel:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "DELETE /images/{name}"
+      Target: !Sub "integrations/${IntDel}"
+
+  # API Gateway jogosultságok a Lambdák hívásához
+  PermGet:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetImagesFunction
+      Principal: apigateway.amazonaws.com
+  PermPre:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PresignedUrlFunction
+      Principal: apigateway.amazonaws.com
+  PermDel:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DeleteImageFunction
+      Principal: apigateway.amazonaws.com
+
+Outputs:
+  ApiUrl:
+    Description: "API végpont URL"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  SourceBucketName:
+    Value: !Ref SourceBucket

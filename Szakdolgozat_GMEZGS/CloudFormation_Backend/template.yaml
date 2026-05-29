@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation Image Processing App
+
+Resources:
+  InS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: in-bucket-gmezgs-cf
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+            - "*"
+            AllowedMethods:
+            - "PUT"
+            - "POST"
+            - "GET"
+            AllowedOrigins:
+            - "*"
+            ExposedHeaders:
+            - "ETag"
+            MaxAge: 3000
+
+  OutS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: out-bucket-gmezgs-cf
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+            - "*"
+            AllowedMethods:
+            - "PUT"
+            - "POST"
+            - "GET"
+            AllowedOrigins:
+            - "*"
+            ExposedHeaders:
+            - "ETag"
+            MaxAge: 3000
+
+  OutBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutS3Bucket
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref OutS3Bucket
+                - /*
+
+  S3ToStepFunctionsTrigger: 
+    Type: AWS::Events::Rule
+    Properties:
+      Name: s3-upload-trigger-cf
+      Description: Trigger for S3 uploads
+      Targets:
+        - Id: TriggerStepFunctions
+          Arn: !Ref StepFunctions
+          RoleArn: "arn:aws:iam::483288572425:role/LabRole"
+      EventPattern: !Sub |
+        {
+          "source" : ["aws.s3"],
+          "detail-type" : ["Object Created"],
+          "detail" : {
+            "bucket" : {
+              "name" : ["${InS3Bucket}"]
+            }
+          }
+        }
+
+  StepFunctions:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: sfn-for-lambdas-cf
+      RoleArn: "arn:aws:iam::483288572425:role/LabRole"
+      DefinitionString: !Sub |
+        {
+            "Comment": "A sfn to control the lambdas for image processing",
+            "StartAt": "FormatCheck",
+            "States": {
+                "FormatCheck": {
+                    "Type": "Task",
+                    "Resource": "${FormatCheckLambda.Arn}",
+                    "Next": "Rekognition"
+                },
+                "Rekognition": {
+                    "Type": "Task",
+                    "Resource": "${RekognitionLambda.Arn}",
+                    "Next": "ImageProcessAndUpload"
+                },
+                "ImageProcessAndUpload": {
+                    "Type": "Task",
+                    "Resource": "${ImageProcessAndUploadLambda.Arn}",
+                    "Next": "MetadataUpload"
+                },
+                "MetadataUpload": {
+                    "Type": "Task",
+                    "Resource": "${MetadataUploadLambda.Arn}",
+                    "End": true
+                }
+            }
+        }
+
+  FormatCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: format-check-lambda-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Code:
+        ZipFile: |
+          import boto3
+
+          s3Client = boto3.client("s3")
+          snsClient = boto3.client("sns")
+
+          def main(event, context):
+              try:
+                  in_bucket = event["detail"]["bucket"]["name"]
+                  key = event["detail"]["object"]["key"]
+
+                  if key.lower().endswith((".png", ".jpg", ".jpeg")):
+                      return event
+                  else:
+                      snsClient.publish(
+                          TopicArn = "arn:aws:sns:us-east-1:483288572425:upload-error-message-cf",
+                          Subject = "Nem megfelelő fájl került feltöltésre",
+                          Message = "Hibás formátum! Csak .png, .jpg, és .jpeg fájlok az elfogadottak."
+                      )
+
+                      s3Client.delete_object(
+                          Bucket=in_bucket,
+                          Key=key
+                      )
+
+                      raise Exception("Hibás formátum")
+              
+              except Exception as e:
+                  print(f"Format_check lambda error: {str(e)}")
+                  raise e
+
+  ImageProcessAndUploadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: image-process-and-upload-lambda-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Layers: ["arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p310-Pillow:14"]
+      Code:
+        ZipFile: |
+          import boto3
+          import io
+          from PIL import Image
+          import time
+
+          s3Client = boto3.client("s3")
+
+          def main(event, context):
+              try:
+                  #time.sleep(12)
+                  in_bucket = event["detail"]["bucket"]["name"]
+                  key = event["detail"]["object"]["key"]
+
+                  out_bucket = "out-bucket-gmezgs-cf"
+                  new_key = f"resized_{key}"
+
+                  response = s3Client.get_object(Bucket=in_bucket, Key=key)
+                  img_data = response["Body"].read()
+
+                  image = Image.open(io.BytesIO(img_data))
+                  resized_img = image.resize((500, 500)) 
+
+                  buffer = io.BytesIO()
+                  resized_img.save(buffer, format=image.format)
+                  
+                  buffer.seek(0)
+
+                  s3Client.put_object(
+                      Bucket=out_bucket,
+                      Key=new_key,
+                      Body=buffer,
+                      ContentType=f"image/{image.format}"
+                  )
+
+                  event["processed"] = {
+                      "bucket": out_bucket,
+                      "key": new_key
+                  }
+
+                  return event
+
+              except Exception as e:
+                  print(f"Image_process_and_upload lambda error: {str(e)}")
+                  raise e
+
+  MetadataUploadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: metadata-upload-lambda-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Code:
+        ZipFile: |
+          import boto3
+
+          dynamodbResource = boto3.resource("dynamodb")
+
+          def main(event, context):
+              try:
+                  bucket = event["processed"]["bucket"]
+                  key = event["processed"]["key"]
+                  labels = event["labels"]
+
+                  date = event["time"]
+                  link = f"https://{bucket}.s3.amazonaws.com/{key}"
+                  table = dynamodbResource.Table("image-metadatas-table-gmezgs-cf")
+
+                  table.put_item(
+                      Item={
+                          "FileName": f"{key}",
+                          "Labels": labels,
+                          "Date": date,
+                          "Link": link
+                      }
+                  )
+                  
+                  return event
+
+              except Exception as e:
+                  print(f"Metadata_upload lambda error: {str(e)}")
+                  raise e
+
+  ImageGetLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: image-get-lambda-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          dynamodbResource = boto3.resource("dynamodb")
+
+          def main(event, context):
+              try:
+                  table = dynamodbResource.Table("image-metadatas-table-gmezgs-cf")
+
+                  response = table.scan()
+                  items = response.get("Items", [])
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*" 
+                      },
+                      "body": json.dumps(items)
+                  }
+
+              except Exception as e:
+                  print(f"Image_get lambda error: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*"
+                      },
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  GetPresignedUrlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: get-presigned-url-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Environment:
+        Variables:
+          IN_BUCKET_NAME: !Ref InS3Bucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3Client = boto3.client('s3')
+
+          def main(event, context):
+              try:
+                  bucket = os.environ['IN_BUCKET_NAME']
+                  qs = event.get('queryStringParameters') or {}
+                  fname = qs.get('filename', 'image.png')
+                  url = s3Client.generate_presigned_url('put_object', Params={'Bucket': bucket, 'Key': fname}, ExpiresIn=300)
+                  
+                  return {
+                      "statusCode": 200,
+                      "headers": {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"},
+                      "body": json.dumps({"uploadURL": url})
+                  }
+
+              except Exception as e:
+                  print(f"Get_presigned_url lambda error: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Access-Control-Allow-Origin": "*"},
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  ImageDeleteLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: image-delete-lambda-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Environment:
+        Variables:
+          IN_BUCKET_NAME: !Ref InS3Bucket
+          OUT_BUCKET_NAME: !Ref OutS3Bucket
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          s3Client = boto3.client("s3")
+          dynamodbResource = boto3.resource("dynamodb")
+
+          def main(event, context):
+              try:
+                  qs = event.get("queryStringParameters") or {}
+                  out_filename = qs.get("filename")
+                  in_filename = out_filename.replace("resized_", "", 1)
+
+                  in_bucket = os.environ["IN_BUCKET_NAME"]
+                  out_bucket = os.environ["OUT_BUCKET_NAME"]
+                  table_name = "image-metadatas-table-gmezgs-cf"
+
+                  s3Client.delete_object(Bucket=in_bucket, Key=in_filename)
+                  s3Client.delete_object(Bucket=out_bucket, Key=out_filename)
+                  table = dynamodbResource.Table(table_name)
+                  table.delete_item(Key={"FileName": out_filename})
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {"Access-Control-Allow-Origin": "*"},
+                      "body": json.dumps({"message": "Delete successful!"})
+                  }
+
+              except Exception as e:
+                  print(f"Image_delete lambda error: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Access-Control-Allow-Origin": "*"},
+                      "body": json.dumps({"message": "Delete failed!"})
+                  }
+
+  RekognitionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rekognition-lambda-cf
+      Role: "arn:aws:iam::483288572425:role/LabRole"
+      Runtime: python3.10
+      Timeout: 30
+      Handler: index.main
+      Code:
+        ZipFile: |
+          import boto3
+
+          rekognitionClient = boto3.client("rekognition")
+
+          def main(event, context):
+              try:
+                  in_bucket = event["detail"]["bucket"]["name"]
+                  key = event["detail"]["object"]["key"]
+
+                  response = rekognitionClient.detect_labels(
+                      Image={
+                          'S3Object': {
+                              'Bucket': in_bucket,
+                              'Name': key
+                          }
+                      },
+                      MaxLabels=3,
+                      MinConfidence=75.0
+                  )
+                  
+                  labels_list = response.get("Labels", [])
+                  if not labels_list:
+                      event["labels"] = "Unknown"
+                      return event
+                  else:
+                      label_names = [label["Name"] for label in labels_list]
+                      event["labels"] = ", ".join(label_names)
+                      return event
+                      
+              except Exception as e:
+                  print(f"Rekognition lambda error: {str(e)}")
+                  event["labels"] = "Rekognition error"
+                  return event
+
+  APIGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: get-processed-images-api-cf
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - "GET"
+          - "POST"
+          - "PUT"
+          - "DELETE"
+          - "OPTIONS"
+        AllowHeaders:
+          - "*"
+        MaxAge: 300
+
+  APIGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ImageGetLambda.Arn
+      PayloadFormatVersion: 2.0
+
+  APIGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "GET /"
+      Target: !Sub integrations/${APIGatewayIntegration}
+
+  APIGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: stage
+      ApiId: !Ref APIGateway
+      AutoDeploy: true
+
+  ImageGetLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref ImageGetLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:us-east-1:483288572425:${APIGateway}/*/*"
+
+  GetPresignedUrlIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetPresignedUrlLambda.Arn
+      PayloadFormatVersion: 2.0
+
+  GetPresignedUrlRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "GET /get-upload-url"
+      Target: !Sub "integrations/${GetPresignedUrlIntegration}"
+
+  GetPresignedUrlLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetPresignedUrlLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:us-east-1:483288572425:${APIGateway}/*/*/get-upload-url"
+
+  ImageDeleteIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ImageDeleteLambda.Arn
+      PayloadFormatVersion: 2.0
+
+  ImageDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "DELETE /delete"
+      Target: !Sub "integrations/${ImageDeleteIntegration}"
+
+  ImageDeleteLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ImageDeleteLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:us-east-1:483288572425:${APIGateway}/*/*/delete"
+
+  DynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: image-metadatas-table-gmezgs-cf
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: FileName
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: FileName
+          AttributeType: S
+      TimeToLiveSpecification:
+        AttributeName: TimeToExist
+        Enabled: true
+
+  SNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: upload-error-message-cf
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNS
+      Protocol: email
+      Endpoint: mark.gajdan@gmail.com
+
+  CloudwatchMetricAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: image-upload-fail-alarm-cf
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 10000
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 60
+      AlarmActions:
+        - !Ref SNS
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageProcessAndUploadLambda
